@@ -247,6 +247,130 @@ mcp:
     - eidpiper_status: release state
     - eidpiper_history: audit trail
 
+# ─── Addendum: Gaps Identified by Adversarial Review ──────────────
+# GPT-5.2 + DeepSeek R1 found 15+ gaps. These are the contract amendments.
+
+amendments:
+
+  timeout_and_retry:
+    # Gap: "pending" gate has no timeout, can block forever
+    default_gate_timeout_seconds: 900  # 15 minutes
+    per_stage_override: true           # stages can set their own timeout
+    on_timeout: fail                   # pending → failed after timeout
+    retry:
+      max_retries: 2
+      backoff_seconds: [30, 120]       # 30s then 2min
+      who_retries: eidpiper            # automatic, not manual
+
+  concurrency:
+    # Gap: two people running release on same repo simultaneously
+    model: optimistic_locking
+    mechanism: state file includes a hash; advance checks hash before writing
+    duplicate_detection: if same (repo, version, stage) is already in_progress, refuse
+
+  state_authority:
+    # Gap: where does state live?
+    primary: managed_repo              # .eidpiper/releases/ committed to the managed repo
+    rationale: state travels with the code, visible in PRs, no central SPOF
+    update_method: direct_commit       # not PRs — state updates are operational, not review-worthy
+    branch: main                       # always written to default branch
+    conflict_resolution: last_writer_wins_with_history  # append-only history prevents data loss
+
+  rollback:
+    # Gap: no concept of un-publishing or reverting
+    supported_actions:
+      - yank: marks version as yanked on PyPI (does not delete)
+      - supersede: creates a new version that replaces the bad one
+      - abandon: marks a release as abandoned (never completed)
+    history: append_only               # rollback appends events, never rewrites history
+    new_state: yanked | superseded | abandoned
+
+  monorepo:
+    # Gap: contract assumes repo = one package
+    v1_scope: unsupported              # v1 assumes 1 repo = 1 package
+    future: identity becomes { repo, package } when needed
+    rationale: none of our current repos are monorepos
+
+  pre_release:
+    # Gap: no pre-release version handling
+    v1_scope: supported_as_string      # "0.4.0rc1" is a valid version string
+    channel: null                      # v1 does not distinguish test vs stable PyPI
+    future: add channel field (test | rc | stable) when TestPyPI is needed
+
+  overrides:
+    # Gap: override format undefined
+    format: yaml                       # .eidpiper/overrides.yaml in the managed repo
+    merge_strategy: deep_merge         # override values replace template values
+    scope: variables_only              # can override template variables, not template structure
+    example:
+      python_version: "3.13"
+      os_matrix: ["ubuntu-latest"]
+      extra_steps: null                # v1 does not support injecting extra workflow steps
+
+  drift_statuses:
+    # Gap: "behind" vs "modified" overlap
+    definitions:
+      current: rendered template matches actual file exactly
+      behind: actual file matches an older version of the template (detected via version comment header)
+      missing: workflow file does not exist in repo
+      modified: actual file differs from rendered template AND doesn't match any known template version
+      # "behind + modified" is classified as "modified" (local edits take precedence)
+
+  credentials:
+    # Gap: "never store secrets" but eidpiper needs auth
+    model: github_app                  # preferred: org-wide GitHub App with least privilege
+    fallback: personal_access_token    # acceptable for solo developers
+    scope:
+      - contents: read/write           # to read workflows, commit .eidpiper/ state
+      - pull_requests: write           # to open sync PRs
+      - actions: read                  # to check workflow run status
+    storage: environment_variable      # EIDPIPER_GITHUB_TOKEN or GitHub App key path
+    never_in:
+      - templates
+      - state files
+      - eidpiper.yaml
+
+  gate_abstraction:
+    # Gap: naming specific forges in stages violates conductor guardrail
+    resolution: stages reference gate IDs, not tool names
+    gate_registry:
+      ready: { tool: "foss-forge", command: "/foss-check", adapter: "skill" }
+      sound: { tool: "ship-forge", command: "/ship-check", adapter: "skill" }
+      stamped: { tool: "github-actions", command: "publish.yml", adapter: "workflow" }
+      live: { tool: "railguey", command: "railguey_pypi_status", adapter: "mcp" }
+    extensible: true                   # new gates can be added without changing eidpiper core
+
+  pr_dedup:
+    # Gap: sync may open duplicate PRs
+    branch_naming: eidpiper/sync-{template_version}  # deterministic
+    behavior: if branch exists and PR is open, force-push updated content to same branch
+    never: create a second PR for the same sync operation
+
+  error_taxonomy:
+    # Gap: no structured error codes
+    exit_codes:
+      0: success
+      1: gate_failed
+      2: timeout
+      3: auth_failure
+      4: branch_protection_blocked
+      5: conflict (concurrent modification)
+      6: missing_configuration
+      7: rate_limited
+
+  rate_limiting:
+    # Gap: fleet operations may hit GitHub API limits
+    strategy: sequential_with_backoff  # not parallel by default
+    max_concurrent_repos: 5            # for sync operations
+    retry_on_429: true
+    backoff: exponential
+
+  template_pinning:
+    # Gap: releases should be reproducible against a specific template version
+    behavior: when `eidpiper release` starts, record the current eidpiper version in state
+    state_field: template_version      # added to release state schema
+    reproducibility: re-running a release uses the pinned template, not latest
+
 # ─── What eidpiper is NOT ─────────────────────────────────────────
 
 anti_patterns:
