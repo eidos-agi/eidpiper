@@ -261,20 +261,48 @@ amendments:
       max_retries: 2
       backoff_seconds: [30, 120]       # 30s then 2min
       who_retries: eidpiper            # automatic, not manual
+      idempotency: |
+        Each gate execution gets a unique attempt_id (UUID).
+        State history records attempt_id per entry.
+        The "stamped" gate (publish) is NON-IDEMPOTENT — retrying after
+        partial publish checks PyPI first. If version exists, skip publish
+        and mark passed. This prevents double-publish corruption.
 
   concurrency:
     # Gap: two people running release on same repo simultaneously
-    model: optimistic_locking
-    mechanism: state file includes a hash; advance checks hash before writing
-    duplicate_detection: if same (repo, version, stage) is already in_progress, refuse
+    # REVISED after round 2: optimistic locking via git is insufficient.
+    model: lease_based
+    mechanism: |
+      State file includes a "lock" field: { holder: string, acquired: datetime, expires: datetime }.
+      Before advancing, eidpiper attempts to acquire the lock by committing a state update.
+      If push fails (non-fast-forward), pull, check lock, retry.
+      Lock expires after lease_duration_seconds — prevents permanent wedge from crashed processes.
+    lease_duration_seconds: 1800       # 30 minutes — covers longest expected gate execution
+    break_glass: eidpiper unlock <repo> <version>  # manual override for stuck locks
+    actor_identity: |
+      Lock holder includes: hostname, PID, user (from git config or env).
+      State history records triggered_by alongside the App identity.
+      This preserves human accountability behind the automation.
 
   state_authority:
     # Gap: where does state live?
-    primary: managed_repo              # .eidpiper/releases/ committed to the managed repo
-    rationale: state travels with the code, visible in PRs, no central SPOF
-    update_method: direct_commit       # not PRs — state updates are operational, not review-worthy
-    branch: main                       # always written to default branch
-    conflict_resolution: last_writer_wins_with_history  # append-only history prevents data loss
+    # REVISED after adversarial review round 2: direct_commit to main is incompatible
+    # with branch protection. Two options depending on repo protection:
+    primary: eidpiper_repo             # state lives in eidpiper's own repo, not managed repos
+    location: state/{repo}/            # state/{repo}/v0.4.0.yaml
+    rationale: |
+      Round 2 review proved direct_commit to managed repos fails under branch protection.
+      Central state in eidpiper's own repo avoids: branch protection conflicts, PR overhead
+      for operational state, race conditions with managed repo commits. Tradeoff: state
+      doesn't travel with code. Mitigated by: state is queryable via eidpiper status,
+      and release history is also recorded in CHANGELOG.md which DOES live in the repo.
+    update_method: direct_commit       # to eidpiper's own repo (which we control)
+    conflict_resolution: optimistic_lock_with_retry
+    fallback: |
+      If eidpiper repo is unavailable, state can be reconstructed from:
+      1. Git tags in managed repo
+      2. PyPI version history
+      3. GitHub Actions run history
 
   rollback:
     # Gap: no concept of un-publishing or reverting
@@ -299,13 +327,32 @@ amendments:
 
   overrides:
     # Gap: override format undefined
+    # REVISED after round 2: variables-only can't express structural variance.
+    # Different repo types need different workflow structures.
     format: yaml                       # .eidpiper/overrides.yaml in the managed repo
-    merge_strategy: deep_merge         # override values replace template values
-    scope: variables_only              # can override template variables, not template structure
+    levels:
+      - variables: override template variables (python_version, os_matrix, etc.)
+      - template_selection: choose which template to use per workflow
+        # e.g. a "knowledge" repo uses templates/ci-docs.yml instead of templates/ci.yml
+      - extra_steps: inject additional steps before/after managed steps
+        # e.g. "also run mypy" — appended to the CI workflow
+        # Format: list of step objects matching GitHub Actions step schema
+    merge_strategy: deep_merge for variables, append for extra_steps
+    validation:
+      - eidpiper sync --dry-run MUST warn about dangling overrides (variables
+        that don't match any template variable)
+      - extra_steps MUST NOT override managed steps (append only)
     example:
-      python_version: "3.13"
-      os_matrix: ["ubuntu-latest"]
-      extra_steps: null                # v1 does not support injecting extra workflow steps
+      variables:
+        python_version: "3.13"
+        os_matrix: ["ubuntu-latest"]
+      template_overrides:
+        ci.yml: templates/ci-with-mypy.yml  # use a different template
+      extra_steps:
+        ci.yml:
+          after_tests:
+            - name: Run mypy
+              run: mypy src/
 
   drift_statuses:
     # Gap: "behind" vs "modified" overlap
@@ -332,13 +379,36 @@ amendments:
 
   gate_abstraction:
     # Gap: naming specific forges in stages violates conductor guardrail
+    # REVISED after round 2: "skill" adapter is unusable from CLI.
+    # All adapters must be invocable from a CLI context.
     resolution: stages reference gate IDs, not tool names
+    adapter_types:
+      - script: runs a shell command, checks exit code (0 = passed, non-0 = failed)
+      - workflow: triggers a GitHub Actions workflow, polls for result
+      - mcp: calls an MCP tool (requires MCP server running)
+      - webhook: POST to a URL, parse JSON response for gate contract
     gate_registry:
-      ready: { tool: "foss-forge", command: "/foss-check", adapter: "skill" }
-      sound: { tool: "ship-forge", command: "/ship-check", adapter: "skill" }
-      stamped: { tool: "github-actions", command: "publish.yml", adapter: "workflow" }
-      live: { tool: "railguey", command: "railguey_pypi_status", adapter: "mcp" }
-    extensible: true                   # new gates can be added without changing eidpiper core
+      ready:
+        adapter: script
+        command: "foss-forge-check"    # a CLI wrapper script that runs the foss checks
+        fallback: skip                 # if command not found, skip with warning (not hard fail)
+      sound:
+        adapter: script
+        command: "ship-forge-check"    # a CLI wrapper script that runs the ship checks
+        fallback: skip
+      stamped:
+        adapter: workflow
+        workflow: publish.yml          # triggers via GitHub API (workflow_dispatch or tag push)
+        success_criteria: workflow_run_completed_successfully
+      live:
+        adapter: mcp
+        tool: railguey_pypi_status     # requires railguey MCP server running
+        fallback: script
+        fallback_command: "curl -s https://pypi.org/pypi/{package_name}/json | python -c 'import json,sys; print(json.load(sys.stdin)[\"info\"][\"version\"])'"
+    extensible: true
+    # NOTE: forges that want to be eidpiper gates SHOULD ship a CLI wrapper
+    # script alongside their skills. This is a forge-forge convention, not
+    # an eidpiper requirement.
 
   pr_dedup:
     # Gap: sync may open duplicate PRs
@@ -367,9 +437,20 @@ amendments:
 
   template_pinning:
     # Gap: releases should be reproducible against a specific template version
-    behavior: when `eidpiper release` starts, record the current eidpiper version in state
-    state_field: template_version      # added to release state schema
-    reproducibility: re-running a release uses the pinned template, not latest
+    # REVISED after round 2: CLI version is wrong key. Pin by template repo commit SHA.
+    behavior: when `eidpiper release` starts, record the template repo commit SHA in state
+    state_fields:
+      template_sha: string             # git commit SHA of the templates/ directory
+      template_tag: string | null      # human-readable tag if available
+    reproducibility: |
+      Re-running a release checks out the pinned SHA to render templates.
+      This ensures code-on-disk matches code-that-ran.
+      Templates are immutable once a release begins — sync cannot update
+      workflows for repos with an in-progress release.
+    immutability_rule: |
+      eidpiper sync MUST refuse to update workflows for a repo that has
+      a release in-progress (current_stage != null and current_stage != live).
+      This prevents the "code on disk != code that runs" divergence.
 
 # ─── What eidpiper is NOT ─────────────────────────────────────────
 
