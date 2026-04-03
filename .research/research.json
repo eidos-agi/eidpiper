@@ -1,0 +1,15 @@
+{
+  "id": "36d3d28d-08c8-4232-b93d-eadefd8ff2b4",
+  "version": "0.1.0",
+  "projectName": "eidpiper Architecture",
+  "created": "2026-04-03",
+  "phase": "research",
+  "transitions": [
+    {
+      "phase": "research",
+      "date": "2026-04-03"
+    }
+  ],
+  "question": "What is the right architecture for eidpiper \u2014 a GitHub Actions fleet manager + release pipeline orchestrator for the Eidos ecosystem?",
+  "context": "eidpiper is a new tool that solves two problems: (1) GitHub Actions workflows are copy-pasted across ~20 repos with inconsistencies, missing files, and manual propagation; (2) no tool owns the full release pipeline from readiness to deployment. The tool manages workflow templates, syncs them to repos, detects drift, and orchestrates releases through existing forges (foss-forge, ship-forge) and tools (railguey). Four models consulted: GPT-5.2 (8/10), Gemini 2.5 Pro (7.5/10 original, not re-graded), DeepSeek R1 (8.5/10 after pivot from 5/10). Consensus: fleet sync is the MVP, release pipeline is V2, combination is the killer feature."
+}
