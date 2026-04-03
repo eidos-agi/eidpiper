@@ -1,0 +1,259 @@
+# eidpiper Contract v1 — What eidpiper must do, how it must behave
+#
+# This is the specification. Code that violates this contract is wrong.
+# Code that isn't described here isn't needed yet.
+#
+# Three domains: Fleet, Pipeline, State.
+
+contract_version: 1
+name: eidpiper
+description: GitHub Actions fleet manager + release pipeline orchestrator
+
+# ─── Domain 1: Fleet ──────────────────────────────────────────────
+# Managing GitHub Actions workflows across a fleet of repos.
+
+fleet:
+
+  registry:
+    # eidpiper knows which repos it manages
+    file: eidpiper.yaml  # lives in eidpiper's own repo
+    schema:
+      org: string                    # GitHub org (e.g. eidos-agi)
+      repos:
+        - name: string              # repo name
+          type: pypi_package | service | library | knowledge  # what kind of repo
+          managed_workflows:         # which workflows eidpiper manages here
+            - ci.yml
+            - publish.yml
+          overrides: string | null   # path to per-repo override file (e.g. .eidpiper/overrides.yaml)
+          enabled: bool              # can opt-out
+
+  templates:
+    # Canonical workflow templates, versioned
+    location: templates/             # directory in eidpiper repo
+    versioning: git_tags             # templates are versioned by eidpiper's own tags
+    files:
+      - templates/ci.yml            # canonical CI workflow
+      - templates/publish.yml       # canonical publish workflow (with guardrails)
+    variables:
+      # Templates use {{ variables }} that get resolved per-repo
+      - python_version: string      # e.g. "3.12"
+      - package_name: string        # PyPI package name
+      - os_matrix: list[string]     # e.g. ["ubuntu-latest", "macos-latest"]
+      - has_tests: bool             # whether to run pytest
+      - changelog_format: string    # e.g. "## v${VERSION}" — the grep pattern
+
+  sync:
+    # How eidpiper pushes templates to repos
+    command: eidpiper sync
+    behavior:
+      - reads fleet.registry to discover repos
+      - for each repo, renders templates with repo-specific variables
+      - compares rendered template to repo's actual workflow file
+      - if different, opens a PR (or reports drift in dry-run mode)
+    modes:
+      - dry_run: report drift only, change nothing
+      - pr: open PRs for out-of-sync repos
+      - force: overwrite without PR (dangerous, requires --force flag)
+    constraints:
+      - MUST NOT open PRs for repos where enabled == false
+      - MUST NOT modify workflows not listed in managed_workflows
+      - MUST batch changes (one PR per repo, not per file)
+      - MUST respect overrides (merge override into template before comparing)
+
+  drift:
+    # How eidpiper detects and reports inconsistencies
+    command: eidpiper drift
+    behavior:
+      - for each managed repo + managed workflow
+      - renders the canonical template with repo variables
+      - compares to actual file in repo (via GitHub API or local clone)
+      - reports: current | behind | missing | modified (local edits)
+    output:
+      schema:
+        repo: string
+        workflow: string
+        status: current | behind | missing | modified
+        template_version: string    # which eidpiper version the template comes from
+        repo_version: string | null # which version the repo has (from a comment header)
+        diff_lines: int | null      # how many lines differ
+
+  health:
+    # Fleet-wide health report
+    command: eidpiper health
+    behavior:
+      - runs drift check across all repos
+      - aggregates results
+    output:
+      schema:
+        total_repos: int
+        current: int
+        behind: int
+        missing: int
+        modified: int
+        repos: list[drift.output.schema]
+
+# ─── Domain 2: Pipeline ──────────────────────────────────────────
+# Orchestrating releases through gated stages.
+
+pipeline:
+
+  stages:
+    # The forgeline — ordered stages, each with a gate
+    - id: ready
+      name: FOSS Ready
+      gate: foss-forge /foss-check
+      description: License, CONTRIBUTING, CHANGELOG, community health
+      contract:
+        input: { repo: string, version: string }
+        output: { status: passed | failed | pending, message: string, artifacts: object }
+
+    - id: sound
+      name: Ship Sound
+      gate: ship-forge /ship-check
+      description: Tests pass, build succeeds, no lint errors
+      contract:
+        input: { repo: string, version: string }
+        output: { status: passed | failed | pending, message: string, artifacts: object }
+
+    - id: stamped
+      name: Published
+      gate: eidpiper publish
+      description: Tagged, built, published to PyPI, version verified on registry
+      contract:
+        input: { repo: string, version: string }
+        output: { status: passed | failed | pending, message: string, artifacts: object }
+      owns_action: true  # eidpiper triggers the GitHub Action, doesn't run twine itself
+
+    - id: live
+      name: Deployed
+      gate: railguey railguey_pypi_status
+      description: Published version matches deployed version, drift detection passes
+      contract:
+        input: { repo: string, version: string }
+        output: { status: passed | failed | pending, message: string, artifacts: object }
+
+  gate_contract:
+    # Universal interface — every stage gate MUST conform to this
+    # eidpiper NEVER contains stage-specific logic (GUARD-001)
+    input:
+      repo: string
+      version: string
+    output:
+      status: passed | failed | pending
+      message: string           # human-readable explanation
+      artifacts:                # optional, stage-specific
+        log_url: string | null
+        report_url: string | null
+        pypi_url: string | null
+
+  advance:
+    # Move a release through the pipeline
+    command: eidpiper advance <repo> [--version <version>]
+    behavior:
+      - reads current stage from state file
+      - executes the current stage's gate
+      - if gate returns passed, advances to next stage
+      - if gate returns failed, stops and reports why
+      - if gate returns pending, waits (with configurable timeout)
+    constraints:
+      - MUST NOT skip stages
+      - MUST NOT advance if gate returns failed
+      - MUST record every gate execution in state history
+
+  release:
+    # Full release — run all stages in sequence
+    command: eidpiper release <repo> --version <version>
+    behavior:
+      - creates a new release entry in state
+      - advances through all stages sequentially
+      - stops at first failure
+      - reports final status
+    constraints:
+      - MUST verify version exists in pyproject.toml
+      - MUST verify CHANGELOG has entry for version
+      - MUST NOT publish if any prior stage failed
+
+# ─── Domain 3: State ──────────────────────────────────────────────
+# Tracking where each release is in the pipeline.
+
+state:
+
+  location: .eidpiper/releases/     # in each managed repo
+  file_per_version: true             # .eidpiper/releases/v0.4.0.yaml
+
+  schema:
+    version: string                  # e.g. "0.4.0"
+    created: datetime                # when the release was initiated
+    current_stage: string            # ready | sound | stamped | live
+    history:                         # audit trail
+      - stage: string
+        status: passed | failed
+        timestamp: datetime
+        message: string
+        gate: string                 # which tool/command ran
+        duration_seconds: float
+
+  queries:
+    # What agents and humans can ask
+    - command: eidpiper status <repo>
+      returns: current stage for latest release, history summary
+    - command: eidpiper status --all
+      returns: all managed repos, their latest release, current stage
+    - command: eidpiper history <repo> <version>
+      returns: full audit trail for a specific version
+
+# ─── CLI Interface ────────────────────────────────────────────────
+
+cli:
+  commands:
+    # Fleet
+    - eidpiper sync [--dry-run]          # sync templates to repos
+    - eidpiper drift [<repo>]            # check workflow drift
+    - eidpiper health                    # fleet-wide health report
+
+    # Pipeline
+    - eidpiper advance <repo>            # advance to next stage
+    - eidpiper release <repo> --version  # full release pipeline
+    - eidpiper gate <repo> <stage>       # run a single gate manually
+
+    # State
+    - eidpiper status [<repo>]           # current release state
+    - eidpiper history <repo> <version>  # audit trail
+
+    # Meta
+    - eidpiper init <repo>               # add a repo to the fleet
+    - eidpiper doctor                    # check eidpiper health (gh auth, repos accessible, templates valid)
+    - eidpiper version                   # show version
+    - eidpiper help                      # show help
+
+  every_command:
+    - MUST support --help
+    - MUST return structured JSON with --json flag
+    - MUST exit 0 on success, 1 on failure
+    - MUST NOT require interactive input (fully scriptable)
+
+# ─── MCP Interface (V2) ──────────────────────────────────────────
+
+mcp:
+  server_name: eidpiper
+  deferred_to: v2  # CLI first, MCP wraps the same functions
+  tools:
+    - eidpiper_sync: sync templates to repos
+    - eidpiper_drift: check workflow drift
+    - eidpiper_health: fleet health report
+    - eidpiper_advance: advance release stage
+    - eidpiper_release: full release pipeline
+    - eidpiper_status: release state
+    - eidpiper_history: audit trail
+
+# ─── What eidpiper is NOT ─────────────────────────────────────────
+
+anti_patterns:
+  - NEVER run tests, builds, or linters directly (GUARD-002: GHA is the engine)
+  - NEVER contain forge-specific logic (GUARD-001: conductor not player)
+  - NEVER store secrets (GUARD-005)
+  - NEVER modify repo code (only .github/workflows/ and .eidpiper/)
+  - NEVER open noisy PRs (GUARD-003: batch, report-only mode, opt-out)
+  - NEVER skip stages in the pipeline
+  - NEVER advance a release without recording the gate result
