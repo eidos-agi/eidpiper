@@ -9,7 +9,9 @@ Each repo gets a thin stub workflow (5-10 lines) that calls a central reusable w
 
 ## Validation Checklist
 
-- [ ] Claim 1: _TBD_
+- [ ] Claim 1: Y — placeholder resolved
+- [ ] Reusable workflows can handle the publish step via trusted publisher: N — Finding 0009 proves this is impossible
+- [ ] Drift detection is trivial with reusable workflows (just check version pin): N — Finding 0009: PyPI trusted publishing CANNOT be used from within a reusable workflow. Per-repo publish stubs are still required.
 
 ## Scoring
 

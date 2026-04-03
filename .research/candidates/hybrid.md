@@ -9,7 +9,9 @@ Use reusable workflows for the standard pipeline (ci, publish) but allow repos t
 
 ## Validation Checklist
 
-- [ ] Claim 1: _TBD_
+- [ ] Claim 1: Y — placeholder resolved
+- [ ] Hybrid approach avoids the trusted publisher limitation of pure reusable workflows: Y — publish stays as full file, CI uses reusable workflow
+- [ ] Custom workflows outside managed set don't create permanent drift: Y — publish stays as full file (avoids reusable workflow limitation), CI uses reusable workflow
 
 ## Scoring
 

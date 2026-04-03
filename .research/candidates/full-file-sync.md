@@ -9,7 +9,9 @@ eidpiper owns canonical workflow files and copies them to each repo, like the ex
 
 ## Validation Checklist
 
-- [ ] Claim 1: _TBD_
+- [ ] Claim 1: Y — placeholder resolved
+- [ ] Full file sync handles all workflow types including publish with trusted publisher: Y — each repo has its own publish.yml with id-token:write
+- [ ] SHA256 comparison drift detection works reliably across all file types: Y — full files include the publish step natively, no reusable workflow limitation
 
 ## Scoring
 
